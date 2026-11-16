@@ -6,6 +6,7 @@ using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using PurrNet;
+using PurrNet.Transports;
 using UnityEngine;
 using UnityEngine.Networking;
 
@@ -17,6 +18,10 @@ namespace PurrNet.Recording
         const string Extension = ".purrrec";
         const string SentMarker = ".sent";
         const string ClaimMarker = ".lock";
+        // Next to a recording made while a player was signed in through PurrServices: that player's id. The upload
+        // names the player (their session) only if the same player is still signed in when it is sent, so a
+        // recording is never tied to whoever happens to sign in on this machine later.
+        const string PlayerMarker = ".player";
         const float RetryDelaySeconds = 60f;
         const float HeldGapSeconds = 5f;
         const int TicketTimeoutSeconds = 20;
@@ -112,9 +117,50 @@ namespace PurrNet.Recording
 
         public static void SetActiveRecording(string path)
         {
-            if (_instance)
-                _instance._activePath = path;
+            if (!_instance)
+                return;
+            _instance._activePath = path;
+#if !PURRREC_WEB
+            if (!string.IsNullOrEmpty(path))
+                RememberPlayer(path);
+#endif
         }
+
+#if !PURRREC_WEB
+        /// <summary>Notes who was signed in when the recording started (nothing when nobody was).</summary>
+        static void RememberPlayer(string path)
+        {
+            if (!PurrServicesPlayerSession.isSignedIn)
+                return;
+            try
+            {
+                File.WriteAllText(path + PlayerMarker, PurrServicesPlayerSession.playerId);
+            }
+            catch (Exception)
+            {
+                // Then it is sent without naming the player, as recordings always were.
+            }
+        }
+
+        /// <summary>
+        /// Whether the upload of this recording may carry the signed-in player's session: only when the player who
+        /// was signed in when it was recorded is the one signed in now.
+        /// </summary>
+        static bool MayNamePlayer(string path)
+        {
+            if (!PurrServicesPlayerSession.isSignedIn)
+                return false;
+            try
+            {
+                string recordedBy = File.ReadAllText(path + PlayerMarker).Trim();
+                return string.Equals(recordedBy, PurrServicesPlayerSession.playerId, StringComparison.Ordinal);
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+#endif
 
         public static void NotifyFinished()
         {
@@ -181,9 +227,10 @@ namespace PurrNet.Recording
                 _uploadPath = null;
             }
 
-            foreach (var marker in Directory.GetFiles(_directory, "*" + Extension + SentMarker))
-                if (!File.Exists(marker.Substring(0, marker.Length - SentMarker.Length)))
-                    TryDelete(marker);
+            foreach (var suffix in new[] { SentMarker, PlayerMarker })
+                foreach (var marker in Directory.GetFiles(_directory, "*" + Extension + suffix))
+                    if (!File.Exists(marker.Substring(0, marker.Length - suffix.Length)))
+                        TryDelete(marker);
 
             string newest = null;
             DateTime newestTime = DateTime.MinValue;
@@ -222,6 +269,7 @@ namespace PurrNet.Recording
                 _done.Remove(full);
                 _held.Remove(full);
                 TryDelete(full + SentMarker);
+                TryDelete(full + PlayerMarker);
                 return;
             }
 
@@ -293,7 +341,10 @@ namespace PurrNet.Recording
                         continue;
                     long length = file.Length;
                     if (TryDelete(file.FullName))
+                    {
                         total -= length;
+                        TryDelete(file.FullName + PlayerMarker);
+                    }
                     files[i] = null;
                 }
             }
@@ -392,7 +443,9 @@ namespace PurrNet.Recording
 
                 TicketResponse response = default;
                 bool ok = false;
-                yield return PostJson(_endpoint + "/uploads", JsonUtility.ToJson(ticket), (code, text) =>
+                // A live session ties the recording to its player, so deleting that player's account deletes it.
+                bool namePlayer = MayNamePlayer(full);
+                yield return PostJson(_endpoint + "/uploads", JsonUtility.ToJson(ticket), namePlayer, (code, text) =>
                 {
                     if (code == 200 || code == 201)
                     {
@@ -432,7 +485,7 @@ namespace PurrNet.Recording
                 }
 
                 bool completed = false;
-                yield return PostJson($"{_endpoint}/uploads/{UnityWebRequest.EscapeURL(response.id)}/complete", "{}", (code, text) =>
+                yield return PostJson($"{_endpoint}/uploads/{UnityWebRequest.EscapeURL(response.id)}/complete", "{}", false, (code, text) =>
                 {
                     if (code == 200)
                         completed = true;
@@ -458,7 +511,7 @@ namespace PurrNet.Recording
             }
         }
 
-        IEnumerator PostJson(string url, string json, Action<long, string> done)
+        IEnumerator PostJson(string url, string json, bool namePlayer, Action<long, string> done)
         {
             using var request = new UnityWebRequest(url, UnityWebRequest.kHttpVerbPOST);
             _request = request;
@@ -467,6 +520,8 @@ namespace PurrNet.Recording
             request.timeout = TicketTimeoutSeconds;
             request.SetRequestHeader("Content-Type", "application/json");
             request.SetRequestHeader("Authorization", "Bearer " + _projectKey);
+            if (namePlayer)
+                PurrServicesPlayerSession.Apply(request.SetRequestHeader);
             yield return request.SendWebRequest();
             _request = null;
             done(request.responseCode, request.downloadHandler?.text);
